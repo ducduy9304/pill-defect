@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+
+# images, checkpoints and run outputs: too big for git, kept locally
+data/*
+!data/pill_template.bmp
+models/
+results/
+outputs/
+
+# vendor SDK (Hikrobot license); app/camera.py also finds it in ~/hik_sdk
+hik_sdk/

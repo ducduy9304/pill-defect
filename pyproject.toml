@@ -1,0 +1,24 @@
+[project]
+name = "pill-defect"
+version = "0.1.0"
+description = "Classical image processing for silicone cord-lock pill defects"
+requires-python = ">=3.14,<3.15"  # the CUDA OpenCV build is for Python 3.14
+dependencies = [
+    "anomalib>=2.7.1",
+    "numpy",
+    "pyside6>=6.12.0",
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel",
+    "matplotlib",
+    "nbconvert",
+]
+
+[tool.uv]
+package = false
+# OpenCV comes from the local CUDA build (link_opencv_cuda.sh), never from PyPI
+override-dependencies = ["opencv-python; sys_platform == 'never'", "opencv-python-headless; sys_platform == 'never'"]
