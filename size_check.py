@@ -15,7 +15,10 @@ mm = px x mm_per_px, one scale: datasheet length / median length of the good pil
 Every step drawn on one image: size_check.ipynb.
 
 - Crop: the SKU's template matcher (configs/<sku>.json), PAD px around the template size.
-- Length: rows near the pill axis, walking out to each end. The rounded end only fades in brightness, so the
+- Length: first a rough contour (GrabCut seeded by the template layout) gives each end; the scan below ends
+  END_OUT px past it, so a longer pill still has background at the scan's far end. The contour alone is not
+  the measurement: it leaks into the clamp ring and follows leftover flaps on cut ends (defect/7).
+  Then rows near the pill axis, walking out to each end. The rounded end only fades in brightness, so the
   first edge is where the colour distance from the pill (Lab a,b) crosses halfway between the pill and the
   background level; then each row moves out to the rim, a thin light/dark line on the outline, because where
   the background has the pill's colour (defect/12) the colour edge alone stops ~30 px inside.
@@ -32,7 +35,9 @@ import cv2
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
-PAD = 120                    # margin around the crop so the edges are inside
+PAD = 250                    # margin around the crop: room for a pill ~20% longer plus background past its ends
+END_OUT = 80                 # length: scan this far past the contour end; its last 50 px give the background level
+GC_SCALE = 0.5               # contour (GrabCut) runs at this scale: it only places the length scan, ~4x faster
 INNER = 200                  # length: caliper start, px inside each crop end (before the hole openings)
 ROWS = 40                    # length: rows within +-ROWS of the pill axis
 RIM_IN, RIM_OUT = 10, 50     # length: look for the rim from RIM_IN px inside to RIM_OUT px outside the colour edge
@@ -97,6 +102,26 @@ def rim(grad, ys, edges, step):
         if len(k):
             out[i] = xs[k[-1]]
     return out
+
+
+def contour_ends(crop, g):
+    """Rough left / right pill end (x in the crop): GrabCut mask, blob at the centre, median over the axis rows.
+    Seeds: between the holes = pill (even with a cut end), template outline = maybe pill, crop border = background."""
+    small = cv2.resize(crop, None, fx=GC_SCALE, fy=GC_SCALE, interpolation=cv2.INTER_AREA)
+    s = lambda v: int(round(v * GC_SCALE))
+    r = g['TH'] // 2
+    m = np.full(small.shape[:2], cv2.GC_PR_BGD, np.uint8)
+    cv2.rectangle(m, (s(PAD + r), s(PAD)), (s(PAD + g['TW'] - r), s(PAD + g['TH'])), int(cv2.GC_PR_FGD), -1)
+    for x in (PAD + r, PAD + g['TW'] - r):
+        cv2.circle(m, (s(x), s(g['MID'])), s(r), int(cv2.GC_PR_FGD), -1)
+    m[s(g['MID'] - 100):s(g['MID'] + 100), s(PAD + 300):s(PAD + g['TW'] - 300)] = cv2.GC_FGD
+    b = s(30)
+    m[:b] = m[-b:] = m[:, :b] = m[:, -b:] = cv2.GC_BGD
+    cv2.grabCut(small, m, None, np.zeros((1, 65)), np.zeros((1, 65)), 3, cv2.GC_INIT_WITH_MASK)
+    _, lab = cv2.connectedComponents(np.isin(m, (cv2.GC_FGD, cv2.GC_PR_FGD)).astype(np.uint8))
+    fg = (lab == lab[s(g['MID']), s(PAD + g['TW'] // 2)])[s(g['MID'] - ROWS):s(g['MID'] + ROWS)]
+    left, right = np.median(fg.argmax(1)), fg.shape[1] - 1 - np.median(fg[:, ::-1].argmax(1))
+    return left / GC_SCALE, right / GC_SCALE
 
 
 def caliper(prof, ratio=RATIO):
@@ -178,8 +203,11 @@ def measure(image, sku):
     TH, MID, B, U = g['TH'], g['MID'], g['B'], g['U']
     crop, center, angle, _ = sku['matcher'].crop(image, pad=PAD)
     rows = colour_dist(crop)[MID - ROWS:MID + ROWS]
-    lefts0 = A - half_level(rows[:, A::-1].T)        # colour edge per row, walking left
-    rights0 = B + half_level(rows[:, B:].T)          # walking right
+    xl, xr = contour_ends(crop, g)
+    lo = max(min(int(xl) - END_OUT, A - 100), 0)               # >= 100 samples: half_level wants 50 in, 50 out
+    hi = min(max(int(xr) + END_OUT, B + 100), crop.shape[1])
+    lefts0 = A - half_level(rows[:, A:lo:-1].T)      # colour edge per row, walking left
+    rights0 = B + half_level(rows[:, B:hi].T)        # walking right
     grad = np.abs(cv2.Sobel(cv2.GaussianBlur(crop.astype(np.float32), (0, 0), 1.5), cv2.CV_32F, 1, 0, ksize=3)).sum(2)
     ys = np.arange(MID - ROWS, MID + ROWS)
     lefts, rights = rim(grad, ys, lefts0, -1), rim(grad, ys, rights0, 1)
@@ -222,7 +250,7 @@ def judge(r, cal):
 
 def draw_overlay(image, r, cal, half=900):
     """Raw image around the pill: standard box (yellow), measured box and holes (green ok / red fail),
-    and a red line with the gap in mm from each short end to the standard end."""
+    and a red line with the gap in mm from each end to the standard end (+ = longer, - = shorter)."""
     red, green, yellow = (0, 0, 255), (0, 255, 0), (0, 255, 255)
     inverse = cv2.invertAffineTransform(r['M'])
     to_raw = lambda pts: cv2.transform(np.float32(pts).reshape(-1, 1, 2), inverse).reshape(-1, 2).astype(np.int32)
@@ -236,11 +264,11 @@ def draw_overlay(image, r, cal, half=900):
         if h:
             cv2.circle(img, tuple(int(v) for v in to_raw([h['center']])[0]), int(round(h['radius'])), red if d in r['bad'] else green, 6)
     if 'length' in r['bad']:
-        for end, std in ((r['left'], r['L0']), (r['right'], r['R0'])):
+        for end, std, out in ((r['left'], r['L0'], -1), (r['right'], r['R0'], 1)):   # out: outward direction in x
             if abs(end - std) > cal['limit']['length'] / 2:
                 p, q = to_raw([(end, mid), (std, mid)])
                 cv2.line(img, tuple(int(v) for v in p), tuple(int(v) for v in q), red, 10)
-                cv2.putText(img, f"{-abs(end - std) * cal['mm_per_px']:.2f}", tuple(int(v) for v in p + (-150, -60)), cv2.FONT_HERSHEY_SIMPLEX, 4, red, 10)
+                cv2.putText(img, f"{(end - std) * out * cal['mm_per_px']:+.2f}", tuple(int(v) for v in p + (-150, -60)), cv2.FONT_HERSHEY_SIMPLEX, 4, red, 10)
     c = to_raw([(r['crop'].shape[1] / 2, mid)])[0]  # crop centre = PAD + TW / 2
     return img[max(c[1] - half, 0):c[1] + half, max(c[0] - half, 0):c[0] + half]
 
@@ -281,7 +309,7 @@ def main():
         r = judge(measure(image, sku), cal)
         print(f"{image_path}: {'FAIL ' + ','.join(r['bad']) if r['bad'] else 'ok'}  length {r['length']:.0f}  "
               f"width {r['width']:.0f}  holes {r['hole1']:.0f} {r['hole2']:.0f}  "
-              f"ends short by {r['left'] - r['L0']:+.0f} / {r['R0'] - r['right']:+.0f} px")
+              f"ends vs standard {r['L0'] - r['left']:+.0f} / {r['right'] - r['R0']:+.0f} px (+ longer)")
         out_name = f'{Path(image_path).parent.name}_{Path(image_path).stem}.png'
         cv2.imwrite(str(out_dir / out_name), draw_overlay(image, r, cal))
 
